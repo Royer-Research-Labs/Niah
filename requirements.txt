@@ -1,0 +1,14 @@
+# Core (required to train the demo model and run NIAH evals + charts)
+torch>=2.0
+numpy
+tiktoken
+matplotlib
+
+# Data prep for the shakespeare demo corpus
+requests
+
+# Optional: only needed if you use a Hugging Face tokenizer instead of gpt2
+# transformers
+
+# Optional: only needed for the LM Evaluation Harness integration (lm_eval_harness/)
+# lm-eval

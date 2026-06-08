@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+out/
+out-*/
+*.bin
+*.pt
+data/**/input.txt
+data/**/*.bin
+results/
+wandb/
+# generated NIAH datasets (regenerate with scripts/prepare_spec.py / build_dataset.py)
+data/niah/
+lm_eval_harness/data/
+*.meta.json
+.venv/
+venv/
+*.egg-info/
