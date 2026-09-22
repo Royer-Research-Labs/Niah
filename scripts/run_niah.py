@@ -68,8 +68,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run the NIAH eval over a nanoGPT checkpoint.")
     ap.add_argument("--ckpt", required=True, help="Path to a nanoGPT ckpt.pt")
     ap.add_argument("--context-length", type=int, nargs="+", default=[192],
-                    help="One or more context lengths (sweep if multiple). Each must be "
-                         "smaller than the model block_size by ~the question length.")
+                    help="One or more context lengths (sweep if multiple): tokens of scored model "
+                         "input, question included. Each must be <= the model block_size.")
     ap.add_argument("--num-needles", type=int, default=4)
     ap.add_argument("--samples", type=int, default=5, help="Needle depth placements per keyword.")
     ap.add_argument("--seed", type=int, default=42)

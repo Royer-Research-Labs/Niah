@@ -47,7 +47,7 @@ compile = False
 # --- NIAH during-training eval ---
 niah_eval = True
 niah_eval_interval = 500        # run NIAH every 500 steps
-niah_context_length = 192       # < block_size; leaves headroom for the question
+niah_context_length = 256       # scored input length, question included; <= block_size
 niah_num_needles = 4
 niah_samples = 5
 niah_use_shared_choices = True

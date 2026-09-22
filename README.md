@@ -88,6 +88,16 @@ metrics = run_niah(model, config=NiahConfig(context_length=192, num_needles=4,
 print(metrics["accuracy"], metrics["avg_retrieval_gap_ll"])
 ```
 
+`context_length` is the length of the scored model input: haystack, separator and
+question (plus all but the last token of a multi-token choice). Every row is built to
+exactly that many tokens, so `context_length = block_size` fits the model's full
+window. The adapter reads the window from `block_size`, `max_seq_len` or
+`context_length` on the model's config. Results record `input_length_min/max` and
+`haystack_length_mean` so the built lengths can be checked. (Spec version
+`niah-v4-spec`. Earlier `niah-v3-spec` files, where `context_length` was the haystack
+alone and every prompt ran past it by the question's length, still load with that
+meaning and report `length_basis: "haystack"`.)
+
 To wire it into a training loop, copy the small `# --- NIAH ---` blocks in
 [`train.py`](train.py) (config flags `niah_eval`, `niah_eval_interval`,
 `niah_context_length`, …) and the `estimate_niah()` helper. Set `niah_eval = True`.

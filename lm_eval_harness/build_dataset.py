@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from niah.spec import build_niah_spec, iter_niah_rows  # noqa: E402
+from niah.spec import build_niah_spec, iter_niah_rows, make_prompt  # noqa: E402
 
 
 def main() -> None:
@@ -52,7 +52,7 @@ def main() -> None:
     with out_path.open("w", encoding="utf-8") as f:
         for row in iter_niah_rows(spec):
             record = {
-                "context": f"{row['haystack']}\n\n{question}",
+                "context": make_prompt(row["haystack"], question),
                 "choices": choices,
                 "gold": choices.index(row["needle"]),
                 "depth": row["depth"],

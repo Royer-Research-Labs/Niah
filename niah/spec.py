@@ -23,8 +23,17 @@ import numpy as np
 
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
-NIAH_SPEC_VERSION = "niah-v3-spec"
+NIAH_SPEC_VERSION = "niah-v4-spec"
+NIAH_V3_SPEC_VERSION = "niah-v3-spec"
 NIAH_LEGACY_VERSION = "niah-v2"
+
+# What `context_length` measures. v4 specs mean the whole scored model input: the prompt
+# (haystack + separator + question) plus any continuation tokens fed back in to score a
+# multi-token choice, so a context_length equal to the model's block size fits exactly.
+# v3 specs meant the haystack alone, and every prompt ran past context_length by the
+# question's length; they still load, with that meaning.
+LENGTH_BASIS_INPUT = "input"
+LENGTH_BASIS_HAYSTACK = "haystack"
 
 DEFAULT_QUESTION = "### IMPORTANT DATA: The secret keyword is"
 DEFAULT_FILLER_PHRASE = (
@@ -103,6 +112,11 @@ def make_needle(answer: str, needle_template: str = DEFAULT_NEEDLE_TEMPLATE) -> 
     return needle_template.format(answer=answer)
 
 
+def make_prompt(haystack: str, question: str) -> str:
+    """The scored prompt; every choice is scored as a continuation of it."""
+    return f"{haystack}\n\n{question}"
+
+
 def default_depth_schedule(num_samples: int) -> list[float]:
     return [float(x) for x in np.linspace(0.0, 1.0, int(num_samples)).tolist()]
 
@@ -110,9 +124,11 @@ def default_depth_schedule(num_samples: int) -> list[float]:
 def validate_niah_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(spec, dict):
         raise ValueError("NIAH spec must be a JSON object.")
-    if spec.get("version") != NIAH_SPEC_VERSION:
+    version = spec.get("version")
+    if version not in (NIAH_SPEC_VERSION, NIAH_V3_SPEC_VERSION):
         raise ValueError(
-            f"Unsupported NIAH spec version {spec.get('version')!r}; expected {NIAH_SPEC_VERSION!r}."
+            f"Unsupported NIAH spec version {version!r}; expected {NIAH_SPEC_VERSION!r} "
+            f"(or {NIAH_V3_SPEC_VERSION!r})."
         )
 
     tokenizer_name = str(spec.get("canonical_tokenizer", "")).strip()
@@ -160,6 +176,9 @@ def validate_niah_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     normalized["seed"] = int(spec.get("seed", 42))
     normalized["num_samples"] = int(spec.get("num_samples", len(depths)))
     normalized["use_shared_choices"] = bool(spec.get("use_shared_choices", False))
+    normalized["length_basis"] = (
+        LENGTH_BASIS_INPUT if version == NIAH_SPEC_VERSION else LENGTH_BASIS_HAYSTACK
+    )
     return normalized
 
 
@@ -234,19 +253,93 @@ def _filler_tokens_base(spec: Dict[str, Any], tokenizer) -> list[int]:
     return tokenizer.encode(spec["filler_phrase"] * 100)
 
 
+def _repeat_to(tokens: list[int], n: int) -> list[int]:
+    return (tokens * (n // len(tokens) + 2))[:n]
+
+
+def max_choice_tokens(spec: Dict[str, Any], tokenizer) -> int:
+    return max(len(tokenizer.encode(choice)) for choice in spec["choices"])
+
+
+def input_length(spec: Dict[str, Any], tokenizer, haystack: str) -> int:
+    """Tokens the model is fed to score the longest choice after this haystack: the
+    prompt, plus all but the last token of that choice. Single-token choices are read
+    off the prompt's last position, so there the input is exactly the prompt."""
+    prompt = tokenizer.encode(make_prompt(haystack, spec["question"]))
+    return len(prompt) + max_choice_tokens(spec, tokenizer) - 1
+
+
+def _fit_to_input_length(spec: Dict[str, Any], tokenizer, build) -> tuple[str, int]:
+    """Size a haystack so the scored input is exactly spec["context_length"] tokens.
+
+    ``build(n)`` returns the haystack text built from n filler tokens. The haystack is
+    decoded and re-encoded together with the question, so byte-pair merges at the joins
+    can move the true length by a token or two; the filler count is corrected until the
+    measured input length matches. If merges make the exact length unreachable, the
+    longest haystack that stays within context_length is used, never one that overflows.
+    """
+    target = spec["context_length"]
+    n = target - input_length(spec, tokenizer, build(0))
+    if n < 0:
+        raise ValueError(
+            f"context_length {target} is too short for the needle, question and choices "
+            f"(they need {target - n} tokens)."
+        )
+    under: dict[int, tuple[str, int]] = {}
+    tried = set()
+    while n >= 0 and n not in tried:
+        tried.add(n)
+        haystack = build(n)
+        got = input_length(spec, tokenizer, haystack)
+        if got == target:
+            return haystack, got
+        if got < target:
+            under[n] = (haystack, got)
+        n += target - got
+    # Moving the needle's insert point by a token can change a merge, so the length can
+    # jump by two (e.g. 255 -> 257) and the correction above oscillates. Search nearby.
+    lo, hi = max(0, min(tried) - 8), max(tried) + 8
+    for m in range(lo, hi + 1):
+        if m in tried:
+            continue
+        haystack = build(m)
+        got = input_length(spec, tokenizer, haystack)
+        if got == target:
+            return haystack, got
+        if got < target:
+            under[m] = (haystack, got)
+    if not under:
+        # every correction overshot: step down until the input fits
+        n = min(tried)
+        while n > 0:
+            n -= 1
+            haystack = build(n)
+            got = input_length(spec, tokenizer, haystack)
+            if got <= target:
+                return haystack, got
+        raise ValueError(f"could not fit a haystack within context_length {target}.")
+    return max(under.values(), key=lambda hg: hg[1])
+
+
 def generate_control_haystack(
     spec: Dict[str, Any],
     tokenizer: TokenizerAdapter | None = None,
 ) -> Dict[str, Any]:
-    """A needle-free haystack used to measure each choice's prior likelihood."""
+    """A needle-free haystack used to measure each choice's prior likelihood, sized like
+    the rows so its prompt is scored at the same length."""
     spec = validate_niah_spec(spec)
     tokenizer = _load_spec_tokenizer(spec, tokenizer=tokenizer)
     filler_tokens_base = _filler_tokens_base(spec, tokenizer)
-    ctrl_haystack_tokens = filler_tokens_base[: spec["context_length"]]
-    ctrl_haystack = tokenizer.decode(ctrl_haystack_tokens)
+    if spec["length_basis"] == LENGTH_BASIS_HAYSTACK:
+        ctrl_haystack = tokenizer.decode(filler_tokens_base[: spec["context_length"]])
+    else:
+        ctrl_haystack, _ = _fit_to_input_length(
+            spec, tokenizer, lambda n: tokenizer.decode(_repeat_to(filler_tokens_base, n))
+        )
     return {
         "haystack": ctrl_haystack,
         "haystack_len": len(tokenizer.encode(ctrl_haystack)),
+        "input_len": input_length(spec, tokenizer, ctrl_haystack),
     }
 
 
@@ -254,7 +347,11 @@ def iter_niah_rows(
     spec: Dict[str, Any],
     tokenizer: TokenizerAdapter | None = None,
 ) -> Iterator[Dict[str, Any]]:
-    """Yield one {haystack, needle, depth} row per (choice, depth) placement."""
+    """Yield one {haystack, needle, depth} row per (choice, depth) placement.
+
+    For v4 specs every row's scored input (see ``input_length``) is exactly
+    context_length tokens; ``input_len`` and ``haystack_len`` record what was built.
+    """
     spec = validate_niah_spec(spec)
     tokenizer = _load_spec_tokenizer(spec, tokenizer=tokenizer)
     filler_tokens_base = _filler_tokens_base(spec, tokenizer)
@@ -265,22 +362,37 @@ def iter_niah_rows(
         if len(needle_tokens) >= context_length:
             raise ValueError("Needle too long for requested context_length.")
 
-        filler_needed = context_length - len(needle_tokens)
-        reps = (filler_needed // len(filler_tokens_base)) + 2
-        filler_tokens = (filler_tokens_base * reps)[:filler_needed]
+        # Filler count that should fill the input once the question is added; the needle's
+        # insert point is fixed from it, so fitting only lengthens or shortens the tail.
+        # (If the insert point moved with the filler count, a merge at the needle's joins
+        # could make the length jump by two and the exact length unreachable.)
+        if spec["length_basis"] == LENGTH_BASIS_HAYSTACK:
+            filler_estimate = context_length - len(needle_tokens)
+        else:
+            filler_estimate = max(0, context_length - input_length(
+                spec, tokenizer, tokenizer.decode(needle_tokens)))
 
         for depth in spec["depths"]:
-            insert_pos = int(filler_needed * float(depth))
-            haystack_tokens = (
-                filler_tokens[:insert_pos] + needle_tokens + filler_tokens[insert_pos:]
-            )
-            if len(haystack_tokens) != context_length:
-                raise AssertionError("Generated haystack length did not match context_length.")
+            insert_pos = int(filler_estimate * float(depth))
+
+            def build(filler_needed: int, insert_pos: int = insert_pos) -> str:
+                filler_tokens = _repeat_to(filler_tokens_base, max(filler_needed, insert_pos))
+                return tokenizer.decode(
+                    filler_tokens[:insert_pos] + needle_tokens + filler_tokens[insert_pos:]
+                )
+
+            if spec["length_basis"] == LENGTH_BASIS_HAYSTACK:
+                haystack = build(filler_estimate)
+                got = input_length(spec, tokenizer, haystack)
+            else:
+                haystack, got = _fit_to_input_length(spec, tokenizer, build)
 
             yield {
-                "haystack": tokenizer.decode(haystack_tokens),
+                "haystack": haystack,
                 "needle": answer,
                 "depth": f"{float(depth):.2f}",
+                "haystack_len": len(tokenizer.encode(haystack)),
+                "input_len": got,
             }
 
 
@@ -295,6 +407,7 @@ def legacy_meta_from_spec(
         "generated_from_spec_version": spec["version"],
         "canonical_tokenizer": spec["canonical_tokenizer"],
         "context_length": spec["context_length"],
+        "length_basis": spec["length_basis"],
         "question": spec["question"],
         "choices": list(spec["choices"]),
         "control": control,
@@ -335,12 +448,11 @@ def materialize_niah_jsonl(
             f.write("\n")
             row_count += 1
 
-            test_prompt = f"{row['haystack']}\n\n{spec['question']}"
-            last_enc_prompt_len = len(tokenizer.encode(test_prompt))
-            if last_enc_prompt_len <= spec["context_length"]:
+            last_enc_prompt_len = len(tokenizer.encode(make_prompt(row["haystack"], spec["question"])))
+            if spec["length_basis"] == LENGTH_BASIS_INPUT and row["input_len"] > spec["context_length"]:
                 raise AssertionError(
-                    f"Encoded prompt length mismatch: expected > {spec['context_length']} "
-                    f"found {last_enc_prompt_len}"
+                    f"Scored input {row['input_len']} tokens exceeds context_length "
+                    f"{spec['context_length']}"
                 )
 
     return {

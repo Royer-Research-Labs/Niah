@@ -1,6 +1,7 @@
 # LM Evaluation Harness task: NIAH as a multiple-choice retrieval eval.
 #
-# Build the dataset first (keep --tokens below the model block_size; the demo is 256):
+# Build the dataset first (--tokens is the full prompt length, question included; keep it
+# <= the model block_size, which is 256 in the demo):
 #   python lm_eval_harness/build_dataset.py --tokens 192 --samples 5 --choices 4 \
 #       --out lm_eval_harness/data/niah_192.jsonl
 #

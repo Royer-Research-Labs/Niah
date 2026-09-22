@@ -30,8 +30,14 @@ class NanoGPTAdapter:
         self.device = device
         self.tokenizer = tokenizer
         cfg = getattr(self.model, "config", None)
-        # nanoGPT exposes block_size; fall back to max_seq_len for compatibility.
-        self.block_size = int(getattr(cfg, "block_size", getattr(cfg, "max_seq_len", 0)) or 0)
+        # nanoGPT exposes block_size; other models name it max_seq_len or context_length.
+        # 0 (unknown) disables the length guard and truncation, so resolve all three.
+        self.block_size = 0
+        for name in ("block_size", "max_seq_len", "context_length"):
+            value = getattr(cfg, name, None)
+            if value:
+                self.block_size = int(value)
+                break
 
     def encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text)

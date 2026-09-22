@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from .common import all_reduce_sum, dist_info
 from .model_adapter import NanoGPTAdapter
-from .spec import build_niah_spec, generate_control_haystack, iter_niah_rows
+from .spec import build_niah_spec, generate_control_haystack, iter_niah_rows, make_prompt
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -43,7 +43,7 @@ from .tokenizer import TokenizerAdapter, load_tokenizer
 class NiahConfig:
     """Configuration for a single NIAH run."""
 
-    context_length: int = 1024
+    context_length: int = 1024       # tokens of scored model input (prompt + choice), not haystack
     num_needles: int = 4              # number of candidate keywords (choices)
     placements_per_needle: int = 10   # depth positions per needle
     seed: int = 42
@@ -55,7 +55,7 @@ class NiahConfig:
 
 
 def _get_prompt(haystack: str, question: str) -> str:
-    return f"{haystack}\n\n{question}"
+    return make_prompt(haystack, question)
 
 
 def _get_choices_with_needle(needle: str, choices: list[str]) -> list[str]:
@@ -240,15 +240,15 @@ def run_niah(
     except StopIteration:
         return {"error": "Generated NIAH spec was empty."}
 
-    # The haystack is `context_length` tokens, but the scored prompt also appends
-    # the question, so it is longer. Make sure the *full* prompt fits in block_size.
-    first_prompt_len = len(adapter.encode(_get_prompt(first_row["haystack"], spec["question"])))
-    if adapter.block_size and first_prompt_len > adapter.block_size:
+    # context_length is the scored input length (prompt + choice), and every row is built
+    # to it exactly, so it fits whenever context_length <= block_size.
+    first_input_len = int(first_row.get("input_len", 0)) or len(
+        adapter.encode(_get_prompt(first_row["haystack"], spec["question"])))
+    if adapter.block_size and first_input_len > adapter.block_size:
         return {
             "error": (
-                f"NIAH prompt length {first_prompt_len} (haystack {config.context_length} + question) "
-                f"exceeds model block_size {adapter.block_size}. Use a smaller context_length "
-                f"(leave ~{first_prompt_len - config.context_length} tokens of headroom for the question)."
+                f"NIAH input length {first_input_len} exceeds model block_size "
+                f"{adapter.block_size}. Use context_length <= block_size."
             )
         }
 
@@ -277,6 +277,8 @@ def run_niah(
     gap_sum = margin_avg_sum = prior_adjusted_lift_sum = 0.0
     bucket_correct = {"early": 0, "mid": 0, "late": 0}
     bucket_total = {"early": 0, "mid": 0, "late": 0}
+    input_lens: list[int] = []
+    haystack_lens: list[int] = []
 
     for row_idx, row in enumerate(chain([first_row], rows_iter)):
         if dist_active and world_size > 1 and row_idx % world_size != rank:
@@ -286,6 +288,9 @@ def run_niah(
             continue
 
         prompt = _get_prompt(row["haystack"], spec["question"])
+        if "input_len" in row:
+            input_lens.append(int(row["input_len"]))
+            haystack_lens.append(int(row["haystack_len"]))
         scores = _score_choices(adapter, prompt, _get_choices_with_needle(needle, filtered_choices))
         metrics = _compute_metrics(scores, needle, min_retrieval_gap_ll=float(config.win_retrieval_gap_ll))
 
@@ -321,6 +326,10 @@ def run_niah(
         "correct": int(correct),
         "duration_s": duration,
         "context_length": config.context_length,
+        "length_basis": spec["length_basis"],
+        "input_length_max": max(input_lens) if input_lens else None,
+        "input_length_min": min(input_lens) if input_lens else None,
+        "haystack_length_mean": (sum(haystack_lens) / len(haystack_lens)) if haystack_lens else None,
         "placements_per_needle": config.placements_per_needle,
         "num_needles": config.num_needles,
         "evaluated_needles": len(filtered_choices),
