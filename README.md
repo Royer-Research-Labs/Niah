@@ -102,6 +102,30 @@ To wire it into a training loop, copy the small `# --- NIAH ---` blocks in
 [`train.py`](train.py) (config flags `niah_eval`, `niah_eval_interval`,
 `niah_context_length`, …) and the `estimate_niah()` helper. Set `niah_eval = True`.
 
+## Attention diagnostics
+
+`run_niah` says *whether* a model retrieves; `needle_attention_profile` says *which layers
+and heads do it*. It builds the same rows the eval scores and, for each one, asks your model
+for the attention distribution of the last prompt position (the position that predicts the
+answer) in every layer. It then reports the mass on the answer token, on the whole needle
+sentence and on token 0, per head and averaged over rows:
+
+```python
+from niah import needle_attention_profile
+
+def last_row_attention(ids):          # ids: LongTensor[1, T]
+    ...                               # return [layer_attn[:, -1, :] for each layer], each (heads, T)
+
+prof = needle_attention_profile(last_row_attention, context_length=8192, device="cuda")
+for layer in prof["layers"]:
+    print(layer["layer"], layer["answer_max_head"], layer["needle_mean"], layer["first_mean"])
+```
+
+A model that retrieves shows some layer whose best head puts a large share of its mass on
+the answer token. `locate_needle(prompt_ids, answer, spec, tokenizer)` is the helper
+underneath: it finds the needle in an encoded prompt, matching it without its trailing
+space, which merges with the next filler word once the prompt is encoded.
+
 ## LM Evaluation Harness
 
 Run NIAH (or any lm-eval task) against your trained model with the bundled adapter:

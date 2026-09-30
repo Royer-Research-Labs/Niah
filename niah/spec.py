@@ -117,6 +117,26 @@ def make_prompt(haystack: str, question: str) -> str:
     return f"{haystack}\n\n{question}"
 
 
+def locate_needle(prompt_ids: Sequence[int], answer: str, spec: Dict[str, Any], tokenizer) -> tuple[int, int, int] | None:
+    """Token positions of the needle inside an encoded prompt: (start, end, answer_pos).
+
+    ``end`` is exclusive. The needle is matched without its trailing whitespace: in the
+    encoded prompt that space merges with the following filler word, so the needle's own
+    token sequence does not appear intact. Returns None when byte-pair merges at the
+    joins leave no intact copy of the sentence.
+    """
+    needle = tokenizer.encode(make_needle(answer, spec["needle_template"]).rstrip())
+    answer_ids = tokenizer.encode(answer)
+    ids = list(prompt_ids)
+    for start in range(len(ids) - len(needle), -1, -1):
+        if ids[start:start + len(needle)] == needle:
+            for j in range(len(needle) - len(answer_ids), -1, -1):
+                if needle[j:j + len(answer_ids)] == answer_ids:
+                    return start, start + len(needle), start + j
+            return None
+    return None
+
+
 def default_depth_schedule(num_samples: int) -> list[float]:
     return [float(x) for x in np.linspace(0.0, 1.0, int(num_samples)).tolist()]
 
