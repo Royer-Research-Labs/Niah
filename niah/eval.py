@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from .common import all_reduce_sum, dist_info
 from .model_adapter import NanoGPTAdapter
-from .spec import build_niah_spec, generate_control_haystack, iter_niah_rows, make_prompt
+from .spec import build_niah_spec, generate_control_haystack, iter_niah_rows, locate_needle, make_prompt
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
 
@@ -52,6 +52,7 @@ class NiahConfig:
     gap_disqualify: float = 2.0       # ...or any choice with a control margin >= this
     win_retrieval_gap_ll: float = 0.0 # min log-likelihood gap to count a row as a pass
     canonical_tokenizer: str = "gpt2"
+    record_rows: bool = False         # also return one record per scored placement under "rows"
 
 
 def _get_prompt(haystack: str, question: str) -> str:
@@ -279,6 +280,7 @@ def run_niah(
     bucket_total = {"early": 0, "mid": 0, "late": 0}
     input_lens: list[int] = []
     haystack_lens: list[int] = []
+    row_records: list[dict] = []
 
     for row_idx, row in enumerate(chain([first_row], rows_iter)):
         if dist_active and world_size > 1 and row_idx % world_size != rank:
@@ -304,6 +306,18 @@ def run_niah(
         bucket = _bucket_of(float(row["depth"]))
         bucket_total[bucket] += 1
         bucket_correct[bucket] += int(metrics["pass_total"])
+        if config.record_rows:
+            prompt_ids = adapter.encode(prompt)
+            located = locate_needle(prompt_ids, needle, spec, tokenizer)
+            row_records.append({
+                "needle": needle, "depth": float(row["depth"]), "bucket": bucket,
+                "pass": bool(metrics["pass_total"]), "rank_ll": int(metrics["rank_ll"]),
+                "retrieval_gap_ll": float(metrics["retrieval_gap_ll"]),
+                "best_wrong": metrics["best_wrong_ll_choice"],
+                "prompt_tokens": len(prompt_ids),
+                "needle_start": located[0] if located else None,
+                "answer_token": located[2] if located else None,
+            })
 
     duration = time.time() - start
     if dist_active and world_size > 1:
@@ -343,4 +357,6 @@ def run_niah(
         n = bucket_total[bucket_name]
         result[f"{bucket_name}_accuracy"] = (bucket_correct[bucket_name] / n) if n else 0.0
         result[f"{bucket_name}_total"] = int(n)
+    if config.record_rows:   # this process's rows only under distributed evaluation
+        result["rows"] = row_records
     return result
