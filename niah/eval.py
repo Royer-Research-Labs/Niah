@@ -53,6 +53,7 @@ class NiahConfig:
     win_retrieval_gap_ll: float = 0.0 # min log-likelihood gap to count a row as a pass
     canonical_tokenizer: str = "gpt2"
     record_rows: bool = False         # also return one record per scored placement under "rows"
+    prepend_bos: bool = False         # put the tokenizer's end-of-text token in front of every scored prompt
 
 
 def _get_prompt(haystack: str, question: str) -> str:
@@ -80,7 +81,7 @@ class ControlPriorResult:
 
 
 def _score_choices(adapter: NanoGPTAdapter, context: str, choices: list[str]) -> list[ChoiceScore]:
-    ctx_ids = adapter.encode(context)
+    ctx_ids = adapter.encode_context(context)
     choice_tokens = [(choice, adapter.encode(choice)) for choice in choices]
 
     # Fast path: all choices are a single token -> one forward pass.
@@ -214,7 +215,8 @@ def run_niah(
         tokenizer = load_tokenizer(config.canonical_tokenizer)
     canonical_tokenizer = tokenizer.resolved_name
 
-    adapter = NanoGPTAdapter(model=model, ctx=ctx, device=device, tokenizer=tokenizer)
+    adapter = NanoGPTAdapter(model=model, ctx=ctx, device=device, tokenizer=tokenizer,
+                             bos_id=tokenizer.eot_token_id if config.prepend_bos else None)
     dist_active, rank, world_size, backend = dist_info()
 
     if adapter.block_size and config.context_length > adapter.block_size:
@@ -244,7 +246,7 @@ def run_niah(
     # context_length is the scored input length (prompt + choice), and every row is built
     # to it exactly, so it fits whenever context_length <= block_size.
     first_input_len = int(first_row.get("input_len", 0)) or len(
-        adapter.encode(_get_prompt(first_row["haystack"], spec["question"])))
+        adapter.encode_context(_get_prompt(first_row["haystack"], spec["question"])))
     if adapter.block_size and first_input_len > adapter.block_size:
         return {
             "error": (
@@ -307,7 +309,7 @@ def run_niah(
         bucket_total[bucket] += 1
         bucket_correct[bucket] += int(metrics["pass_total"])
         if config.record_rows:
-            prompt_ids = adapter.encode(prompt)
+            prompt_ids = adapter.encode_context(prompt)
             located = locate_needle(prompt_ids, needle, spec, tokenizer)
             row_records.append({
                 "needle": needle, "depth": float(row["depth"]), "bucket": bucket,

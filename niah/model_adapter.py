@@ -23,12 +23,13 @@ from .tokenizer import TokenizerAdapter
 
 
 class NanoGPTAdapter:
-    def __init__(self, model, ctx, device: str, tokenizer: TokenizerAdapter):
+    def __init__(self, model, ctx, device: str, tokenizer: TokenizerAdapter, bos_id: int | None = None):
         # unwrap DDP / torch.compile wrappers when present
         self.model = getattr(model, "module", model)
         self.ctx = ctx
         self.device = device
         self.tokenizer = tokenizer
+        self.bos_id = bos_id  # when set, prepended to every scored context (not to answer choices)
         cfg = getattr(self.model, "config", None)
         # nanoGPT exposes block_size; other models name it max_seq_len or context_length.
         # 0 (unknown) disables the length guard and truncation, so resolve all three.
@@ -41,6 +42,10 @@ class NanoGPTAdapter:
 
     def encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text)
+
+    def encode_context(self, text: str) -> List[int]:
+        ids = self.tokenizer.encode(text)
+        return ids if self.bos_id is None else [int(self.bos_id)] + ids
 
     def get_next_token_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
         with self.ctx:
