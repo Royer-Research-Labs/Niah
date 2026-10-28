@@ -27,9 +27,10 @@ from typing import Any, Dict, Iterator, Sequence
 from .spec import (
     LENGTH_BASIS_INPUT,
     SHARED_CHOICES,
-    _fit_to_input_length,
     default_depth_schedule,
     input_length,
+    make_prompt,
+    max_choice_tokens,
     sample_random_answer_texts,
 )
 from .tokenizer import TokenizerAdapter, load_tokenizer
@@ -114,6 +115,39 @@ def _keyed(spec: Dict[str, Any], key: str) -> Dict[str, Any]:
             "needle_template": spec["needle_template"].replace("{key}", key)}
 
 
+def _fit(view: Dict[str, Any], tokenizer, build, start: int) -> tuple[str, int]:
+    """Size a haystack so the scored input is exactly view["context_length"] tokens, or the longest that stays
+    within it. Like spec._fit_to_input_length, but for natural filler, where re-encoding a decoded slice moves
+    the length by a few tokens unpredictably: a few corrections from `start`, then a small local search.
+    Each candidate is encoded once."""
+    target = view["context_length"]
+    extra = max_choice_tokens(view, tokenizer) - 1
+    seen: dict[int, tuple[str, int]] = {}
+
+    def measure(n: int) -> tuple[str, int]:
+        if n not in seen:
+            haystack = build(n)
+            seen[n] = (haystack, len(tokenizer.encode(make_prompt(haystack, view["question"]))) + extra)
+        return seen[n]
+
+    n = max(0, start)
+    for _ in range(6):
+        haystack, got = measure(n)
+        if got == target:
+            return haystack, got
+        n = max(0, n + target - got)
+    best = None
+    for m in sorted(range(max(0, n - 24), n + 25), key=lambda m: abs(m - n)):
+        haystack, got = measure(m)
+        if got == target:
+            return haystack, got
+        if got < target and (best is None or got > best[1]):
+            best = (haystack, got)
+    if best is None:
+        raise ValueError(f"could not fit a haystack within context_length {target}")
+    return best
+
+
 def _needle_tokens(spec, tokenizer, key: str, answer: str) -> list[int]:
     return tokenizer.encode(spec["needle_template"].format(key=key, answer=answer))
 
@@ -130,8 +164,8 @@ def generate_hard_control(spec: Dict[str, Any], tokenizer: TokenizerAdapter | No
     filler = _filler_tokens(spec, tokenizer)
     view = _keyed(spec, CONTROL_KEY)
     offset = _offset(random.Random(f"{spec['seed']}-control"), filler, spec["context_length"])
-    haystack, got = _fit_to_input_length(
-        view, tokenizer, lambda n: tokenizer.decode(filler[offset:offset + n]))
+    start = spec["context_length"] - input_length(view, tokenizer, "")
+    haystack, got = _fit(view, tokenizer, lambda n: tokenizer.decode(filler[offset:offset + n]), start)
     return {"haystack": haystack, "question": view["question"],
             "haystack_len": len(tokenizer.encode(haystack)), "input_len": got}
 
@@ -168,7 +202,7 @@ def iter_niah_hard_rows(spec: Dict[str, Any], tokenizer: TokenizerAdapter | None
                     body[pos:pos] = ts
                 return tokenizer.decode(body)
 
-            haystack, got = _fit_to_input_length(view, tokenizer, build)
+            haystack, got = _fit(view, tokenizer, build, filler_estimate)
             yield {"haystack": haystack, "needle": answer, "depth": f"{float(depth):.2f}",
                    "key": target_key, "question": view["question"], "distractors": distractors,
                    "filler_offset": offset, "needle_tokens": needles_len,
