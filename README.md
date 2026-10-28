@@ -102,6 +102,35 @@ To wire it into a training loop, copy the small `# --- NIAH ---` blocks in
 [`train.py`](train.py) (config flags `niah_eval`, `niah_eval_interval`,
 `niah_context_length`, …) and the `estimate_niah()` helper. Set `niah_eval = True`.
 
+## Hard mode
+
+The standard haystack repeats one paragraph and plants one fact, so a model can pass by spotting the only
+sentence that breaks the pattern. Hard mode asks the same question under harder conditions:
+
+- **Natural filler.** Each placement's haystack is a contiguous slice of a long natural-text file you supply,
+  from a seeded offset, so nothing repeats.
+- **Keyed distractors.** Besides the target, `num_distractors` other facts of the same form are planted at
+  seeded depths: "The secret keyword for the *Cedar* project is *rain*." The question names one project, and
+  every distractor's keyword is itself one of the scored choices, so retrieving "a keyword" without binding
+  it to its key picks a distractor.
+
+Scoring is unchanged (likelihood over the choices, the control prior, v4 input lengths). The result adds
+`mode`, `num_distractors` and `distractor_pick_rate` (the fraction of placements whose top choice was a
+distractor's keyword); with `record_rows=True` each row also records its key, distractors and choice.
+
+```python
+from niah import NiahConfig, run_niah
+
+cfg = NiahConfig(context_length=8192, num_needles=8, placements_per_needle=10,
+                 mode="hard", filler_path="filler.txt", num_distractors=3)
+metrics = run_niah(model, config=cfg, device="cuda")
+print(metrics["accuracy"], metrics["distractor_pick_rate"])
+```
+
+The filler file needs at least `context_length` + 64 tokens; its SHA-256 is recorded in the spec, so a run
+can be reproduced only with the same file. `num_distractors=0` keeps the natural filler alone, which
+separates the two difficulties. The code is in [`niah/hard.py`](niah/hard.py).
+
 ## Attention diagnostics
 
 `run_niah` says *whether* a model retrieves; `needle_attention_profile` says *which layers
@@ -146,6 +175,7 @@ See [`lm_eval_harness/README.md`](lm_eval_harness/README.md) for the full guide.
 ```
 niah/                     the eval package (model-agnostic)
   spec.py                 build haystacks / needles / choices; materialize datasets
+  hard.py                 hard mode: natural filler + keyed distractors
   eval.py                 run_niah(): the method (control prior + MC scoring)
   model_adapter.py        score a nanoGPT-style model (encode / logits / continuation)
   tokenizer.py            gpt2 (tiktoken) + optional Hugging Face tokenizers
@@ -168,6 +198,7 @@ examples/                 committed sample results + charts
 | `avg_prior_adjusted_lift_ll` | retrieval gap adjusted for each choice's control-prior margin |
 | `early_accuracy` / `mid_accuracy` / `late_accuracy` | accuracy by needle depth bucket |
 | `evaluated_needles` / `disqualified_needles` | choices kept vs. removed by the control prior |
+| `distractor_pick_rate` | hard mode: fraction of placements whose top choice was a distractor's keyword |
 
 ## License
 

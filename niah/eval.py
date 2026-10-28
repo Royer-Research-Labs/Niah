@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from .common import all_reduce_sum, dist_info
 from .model_adapter import NanoGPTAdapter
+from .hard import build_niah_hard_spec, generate_hard_control, iter_niah_hard_rows, keyed_spec_for_row
 from .spec import build_niah_spec, generate_control_haystack, iter_niah_rows, locate_needle, make_prompt
 from .tokenizer import TokenizerAdapter, load_tokenizer
 
@@ -54,6 +55,9 @@ class NiahConfig:
     canonical_tokenizer: str = "gpt2"
     record_rows: bool = False         # also return one record per scored placement under "rows"
     prepend_bos: bool = False         # put the tokenizer's end-of-text token in front of every scored prompt
+    mode: str = "standard"            # "hard": natural filler + keyed distractors (niah.hard)
+    filler_path: str | None = None    # hard mode: a long natural-text file for the haystacks
+    num_distractors: int = 3          # hard mode: facts about other keys planted beside the target
 
 
 def _get_prompt(haystack: str, question: str) -> str:
@@ -227,17 +231,36 @@ def run_niah(
             )
         }
 
-    spec = build_niah_spec(
-        tokenizer_name=canonical_tokenizer,
-        tokenizer=tokenizer,
-        use_shared_choices=bool(config.use_shared_choices),
-        num_samples=int(config.placements_per_needle),
-        context_length=int(config.context_length),
-        n_choices=int(config.num_needles),
-        seed=int(config.seed),
-    )
+    hard = config.mode == "hard"
+    if config.mode not in ("standard", "hard"):
+        return {"error": f"unknown NIAH mode {config.mode!r}"}
+    if hard:
+        if not config.filler_path:
+            return {"error": "hard mode needs filler_path (a long natural-text file)"}
+        spec = build_niah_hard_spec(
+            tokenizer_name=canonical_tokenizer,
+            tokenizer=tokenizer,
+            filler_path=config.filler_path,
+            use_shared_choices=bool(config.use_shared_choices),
+            num_samples=int(config.placements_per_needle),
+            context_length=int(config.context_length),
+            n_choices=int(config.num_needles),
+            num_distractors=int(config.num_distractors),
+            seed=int(config.seed),
+        )
+    else:
+        spec = build_niah_spec(
+            tokenizer_name=canonical_tokenizer,
+            tokenizer=tokenizer,
+            use_shared_choices=bool(config.use_shared_choices),
+            num_samples=int(config.placements_per_needle),
+            context_length=int(config.context_length),
+            n_choices=int(config.num_needles),
+            seed=int(config.seed),
+        )
 
-    rows_iter = iter(rows) if rows is not None else iter_niah_rows(spec, tokenizer=tokenizer)
+    row_iter_fn = iter_niah_hard_rows if hard else iter_niah_rows
+    rows_iter = iter(rows) if rows is not None else row_iter_fn(spec, tokenizer=tokenizer)
     try:
         first_row = next(rows_iter)
     except StopIteration:
@@ -246,7 +269,7 @@ def run_niah(
     # context_length is the scored input length (prompt + choice), and every row is built
     # to it exactly, so it fits whenever context_length <= block_size.
     first_input_len = int(first_row.get("input_len", 0)) or len(
-        adapter.encode_context(_get_prompt(first_row["haystack"], spec["question"])))
+        adapter.encode_context(_get_prompt(first_row["haystack"], first_row.get("question", spec["question"]))))
     if adapter.block_size and first_input_len > adapter.block_size:
         return {
             "error": (
@@ -256,11 +279,11 @@ def run_niah(
         }
 
     start = time.time()
-    control = generate_control_haystack(spec, tokenizer=tokenizer)
+    control = (generate_hard_control if hard else generate_control_haystack)(spec, tokenizer=tokenizer)
     ctrl = _score_control(
         adapter,
         control_haystack=control["haystack"],
-        question=spec["question"],
+        question=control.get("question", spec["question"]),
         choice_list=list(spec["choices"]),
         top_k_disqualify=int(config.top_k_disqualify),
         gap_disqualify=float(config.gap_disqualify),
@@ -276,7 +299,7 @@ def run_niah(
             "avg_retrieval_gap_ll": 0.0,
         }
 
-    correct = total = pass_avg = 0
+    correct = total = pass_avg = distractor_picks = 0
     gap_sum = margin_avg_sum = prior_adjusted_lift_sum = 0.0
     bucket_correct = {"early": 0, "mid": 0, "late": 0}
     bucket_total = {"early": 0, "mid": 0, "late": 0}
@@ -291,7 +314,7 @@ def run_niah(
         if needle in ctrl.prior_disqualified:
             continue
 
-        prompt = _get_prompt(row["haystack"], spec["question"])
+        prompt = _get_prompt(row["haystack"], row.get("question", spec["question"]))
         if "input_len" in row:
             input_lens.append(int(row["input_len"]))
             haystack_lens.append(int(row["haystack_len"]))
@@ -305,12 +328,16 @@ def run_niah(
         margin_avg_sum += float(metrics["margin_avg"])
         prior_adjusted_lift_sum += float(metrics["retrieval_gap_ll"] - ctrl.control_margin_by_choice.get(needle, 0.0))
 
+        distractor_answers = {d["answer"] for d in row.get("distractors", [])}
+        picked_distractor = (not metrics["pass_total"]) and metrics["best_total_choice"] in distractor_answers
+        distractor_picks += int(picked_distractor)
+
         bucket = _bucket_of(float(row["depth"]))
         bucket_total[bucket] += 1
         bucket_correct[bucket] += int(metrics["pass_total"])
         if config.record_rows:
             prompt_ids = adapter.encode_context(prompt)
-            located = locate_needle(prompt_ids, needle, spec, tokenizer)
+            located = locate_needle(prompt_ids, needle, keyed_spec_for_row(spec, row) if hard else spec, tokenizer)
             row_records.append({
                 "needle": needle, "depth": float(row["depth"]), "bucket": bucket,
                 "pass": bool(metrics["pass_total"]), "rank_ll": int(metrics["rank_ll"]),
@@ -319,18 +346,20 @@ def run_niah(
                 "prompt_tokens": len(prompt_ids),
                 "needle_start": located[0] if located else None,
                 "answer_token": located[2] if located else None,
+                **({"key": row["key"], "picked_distractor": bool(picked_distractor),
+                    "best": metrics["best_total_choice"], "distractors": row["distractors"]} if hard else {}),
             })
 
     duration = time.time() - start
     if dist_active and world_size > 1:
         reduced = all_reduce_sum(
-            [float(correct), float(total), float(pass_avg), float(gap_sum), float(margin_avg_sum),
+            [float(correct), float(total), float(pass_avg), float(distractor_picks), float(gap_sum), float(margin_avg_sum),
              float(prior_adjusted_lift_sum), float(bucket_correct["early"]), float(bucket_correct["mid"]),
              float(bucket_correct["late"]), float(bucket_total["early"]), float(bucket_total["mid"]),
              float(bucket_total["late"])],
             device=device, backend=backend,
         )
-        (correct, total, pass_avg, gap_sum, margin_avg_sum, prior_adjusted_lift_sum,
+        (correct, total, pass_avg, distractor_picks, gap_sum, margin_avg_sum, prior_adjusted_lift_sum,
          bucket_correct["early"], bucket_correct["mid"], bucket_correct["late"],
          bucket_total["early"], bucket_total["mid"], bucket_total["late"]) = reduced
 
@@ -354,7 +383,12 @@ def run_niah(
         "avg_margin_avg": (margin_avg_sum / total) if total else 0.0,
         "avg_prior_adjusted_lift_ll": (prior_adjusted_lift_sum / total) if total else 0.0,
         "avg_pass_accuracy": (pass_avg / total) if total else 0.0,
+        "mode": config.mode,
     }
+    if hard:
+        result.update({"spec_version": spec["version"], "num_distractors": spec["num_distractors"],
+                       "distractor_pick_rate": (distractor_picks / total) if total else 0.0,
+                       "filler_sha256": spec["filler_sha256"]})
     for bucket_name in ("early", "mid", "late"):
         n = bucket_total[bucket_name]
         result[f"{bucket_name}_accuracy"] = (bucket_correct[bucket_name] / n) if n else 0.0
