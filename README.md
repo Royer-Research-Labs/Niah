@@ -202,5 +202,5 @@ examples/                 committed sample results + charts
 
 ## License
 
-MIT. The vendored nanoGPT files (`model.py`, `train.py`, `configurator.py`,
-`data/shakespeare/prepare.py`) are © Andrej Karpathy; see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The vendored nanoGPT files (`model.py`, `train.py`, `configurator.py`,
+`data/shakespeare/prepare.py`) are © Andrej Karpathy, also MIT; their notice is in [NOTICE](NOTICE).
