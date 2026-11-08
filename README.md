@@ -5,13 +5,16 @@ testing to a language model. It bundles everything end to end:
 
 - an **open-source training loop + model** ([nanoGPT](https://github.com/karpathy/nanoGPT), MIT),
 - the NIAH eval as a **standalone** run over a checkpoint **and** as a **during-training** eval,
-- **charting** tools (the classic depth × context-length heatmap), and
+- **charting** tools (the classic depth × context-length heatmap, and side-by-side comparisons of several models), and
 - a ready-made **[LM Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness)** integration.
 
 The goal is to make NIAH testing a drop-in: train a tiny model, watch retrieval
 accuracy evolve during training, then sweep context lengths and chart the result.
 
-![NIAH heatmap](examples/sample_heatmap.png)
+![Retrieval vs haystack length for two 209M models trained at 16K](examples/real_209m_16k_accuracy.png)
+
+*Niah on two published 209M-parameter models trained at a 16K context ([details below](#example-two-209m-models-trained-at-16k)):
+softmax attention with RoPE fails just past its training length, while dilution attention keeps retrieving out to 256K.*
 
 ## The method (and why it's small-model friendly)
 
@@ -74,6 +77,52 @@ step 500: NIAH accuracy 0.333 (retrieval gap -0.56, n=15, ctx=192)
 > The demo is a from-scratch 10M model on ~300k tokens — accuracy stays modest. It
 > exists to exercise the whole loop, not to top a leaderboard. Scale `n_layer`,
 > `n_embd`, `block_size`, `max_iters`, and your corpus for real numbers.
+
+## Example: two 209M models trained at 16K
+
+The charts at the top come from two models of the [DilutionAttention](https://github.com/Royer-Research-Labs/Dilution-Attention)
+study, both published on Hugging Face: 24-layer, 209M-parameter decoders trained identically at a 16K context on
+4.19B FineWeb-Edu tokens, differing only in the attention operator.
+
+| model | attention | Hugging Face |
+|---|---|---|
+| dilution | dilution attention, no position encoding | [dilution-209m-16k-nope-1x-s2357](https://huggingface.co/Royer-Research-Labs/dilution-209m-16k-nope-1x-s2357) |
+| softmax + RoPE | standard softmax attention, RoPE (θ = 500,000) | [softmax-209m-16k-rope-1x-s1337](https://huggingface.co/Royer-Research-Labs/softmax-209m-16k-rope-1x-s1337) |
+
+Both were swept with Niah from 256 tokens to 64K (softmax) or 256K (dilution) haystacks: 8 keywords, 20 depth
+placements per keyword inside the training context and 10 past it, scored by likelihood with the control prior (one of
+the 8 choices is disqualified, so chance is 1/7 ≈ 0.14). The softmax model is also shown with NTK-scaled RoPE, a common
+inference-time fix for longer inputs.
+
+For the depth view the same two checkpoints were swept again with per-placement records (`NiahConfig(record_rows=True)`):
+21 needle depths from 0% to 100%, 8 keywords at each depth, from 1K to 64K (softmax) or 256K (dilution). Each cell is the
+share of keywords retrieved at that depth and length.
+
+![Retrieval by needle depth and context length](examples/real_209m_16k_rows_grid.png)
+
+The grid shows where each model fails. Softmax + RoPE starts losing needles placed near the start of the input at 8K-12K,
+inside its own training window, then fails at every depth past 16K. Dilution retrieves every needle at every depth to 96K;
+past that it degrades gradually and evenly across depths (0.96 at 128K, 0.82 at 192K, 0.76 at 256K overall). These are
+single seeds; the DilutionAttention repository has the seed-to-seed comparison. The grid's result files are in
+[`examples/real_209m_16k/`](examples/real_209m_16k/).
+
+The charts are made with `scripts/compare_results.py`, which takes one or more result files per model (an in-context
+sweep plus extrapolation sweeps are merged) and draws the depth grid whenever the results carry per-placement rows:
+
+```bash
+# accuracy vs length (top of this page), from the published sweeps
+python scripts/compare_results.py \
+    --series "Dilution, no position encoding=dil_16k.json,dil_64k.json,dil_128k.json,dil_256k.json" \
+    --series "Softmax + RoPE=rope_16k.json,rope_64k.json" \
+    --series "Softmax + RoPE, NTK-scaled=rope_16k.json,rope_64k_ntk.json" --dashed "Softmax + RoPE, NTK-scaled" \
+    --trained-length 16384 --chance 0.1429 --out-dir examples --prefix real_209m_16k
+
+# the depth grid, from the per-placement sweeps shipped in examples/real_209m_16k/
+python scripts/compare_results.py \
+    --series "Dilution, no position encoding=examples/real_209m_16k/dilution-209m-16k-nope-1x-s2357.json" \
+    --series "Softmax + RoPE=examples/real_209m_16k/softmax-209m-16k-rope-1x-s1337.json" \
+    --trained-length 16384 --chance 0.1429 --out-dir examples --prefix real_209m_16k_rows
+```
 
 ## Add NIAH to your own training run
 
@@ -179,14 +228,14 @@ niah/                     the eval package (model-agnostic)
   eval.py                 run_niah(): the method (control prior + MC scoring)
   model_adapter.py        score a nanoGPT-style model (encode / logits / continuation)
   tokenizer.py            gpt2 (tiktoken) + optional Hugging Face tokenizers
-  charting.py             depth × context heatmap + accuracy-vs-context line
+  charting.py             depth × context heatmap, accuracy-vs-context line, multi-model comparisons
 model.py, train.py        vendored nanoGPT (MIT); train.py adds the NIAH hook
 configurator.py           nanoGPT's config-override helper
 config/train_niah_demo.py small, fast, NIAH-capable demo config
 data/shakespeare/         GPT-2 BPE corpus prep (train.bin / val.bin)
-scripts/                  run_niah.py, prepare_spec.py, chart_results.py, run_sweep.*
+scripts/                  run_niah.py, prepare_spec.py, chart_results.py, compare_results.py, run_sweep.*
 lm_eval_harness/          lm-eval model adapter, task YAML, dataset builder, launcher
-examples/                 committed sample results + charts
+examples/                 committed sample results + charts (demo, and the 209M comparison)
 ```
 
 ## Metrics returned by `run_niah`
